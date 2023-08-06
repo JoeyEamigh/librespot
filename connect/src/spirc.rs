@@ -664,6 +664,8 @@ impl SpircTask {
     }
 
     fn handle_player_event(&mut self, event: PlayerEvent) -> Result<(), Error> {
+        trace!("Received Spirc PlayerEvent::{:?}", event);
+
         // update play_request_id
         if let PlayerEvent::PlayRequestIdChanged { play_request_id } = event {
             self.play_request_id = Some(play_request_id);
@@ -843,7 +845,7 @@ impl SpircTask {
     }
 
     fn handle_remote_update(&mut self, update: Frame) -> Result<(), Error> {
-        trace!("Received update frame: {:#?}", update);
+        // trace!("Received update frame: {:#?}", update);
 
         // First see if this update was intended for us.
         let device_id = &self.ident;
@@ -1060,6 +1062,7 @@ impl SpircTask {
         self.update_tracks(state);
 
         if !self.state.track.is_empty() {
+            trace!("SpircTask handle_load: load_track");
             let start_playing = state.status() == PlayStatus::kPlayStatusPlay;
             self.load_track(start_playing, state.position_ms());
         } else {

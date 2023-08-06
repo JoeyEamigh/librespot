@@ -65,7 +65,7 @@ fn setup_logging(quiet: bool, verbose: bool) {
         }
         Err(_) => {
             if verbose {
-                builder.parse_filters("libmdns=info,librespot=trace");
+                builder.parse_filters("trace,symphonia_format_ogg=warn,librespot_connect::spirc=trace,librespot_core::mercury=debug,librespot_core::cdn_url=debug,rustls=warn,libmdns=warn,librespot_metadata=error");
             } else if quiet {
                 builder.parse_filters("libmdns=warn,librespot=warn");
             } else {

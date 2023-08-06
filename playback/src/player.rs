@@ -504,6 +504,7 @@ impl Player {
     }
 
     fn command(&self, cmd: PlayerCommand) {
+        trace!("Player Command: {:?}", cmd);
         if let Some(commands) = self.commands.as_ref() {
             if let Err(e) = commands.send(cmd) {
                 error!("Player Commands Error: {}", e);
@@ -745,6 +746,7 @@ impl PlayerState {
 
     fn playing_to_end_of_track(&mut self) {
         use self::PlayerState::*;
+        trace!("playing_to_end_of_track state: {:?}", self);
         let new_state = mem::replace(self, Invalid);
         match new_state {
             Playing {
@@ -1174,6 +1176,7 @@ impl Future for PlayerInternal {
             };
 
             if let Some(cmd) = cmd {
+                trace!("PlayerInternal received command: {:?}", cmd);
                 if let Err(e) = self.handle_command(cmd) {
                     error!("Error handling command: {}", e);
                 }
@@ -1263,6 +1266,7 @@ impl Future for PlayerInternal {
                     normalisation_factor,
                     ref mut stream_position_ms,
                     ref mut reported_nominal_start_time,
+                    bytes_per_second,
                     ..
                 } = self.state
                 {
@@ -1291,6 +1295,16 @@ impl Future for PlayerInternal {
                                                 match *reported_nominal_start_time {
                                                     None => true,
                                                     Some(reported_nominal_start_time) => {
+                                                        trace!(
+                                                            "reported_nominal_start_time: {:?}",
+                                                            reported_nominal_start_time
+                                                        );
+                                                        trace!("now: {:?}", now);
+                                                        trace!(
+                                                            "new_stream_position: {:?}",
+                                                            new_stream_position
+                                                        );
+
                                                         let mut notify = false;
 
                                                         if packet_position.skipped {
@@ -1309,6 +1323,7 @@ impl Future for PlayerInternal {
                                                                 reported_nominal_start_time,
                                                             )
                                                         {
+                                                            trace!("time since start: {:?}", lag);
                                                             if let Some(lag) =
                                                                 lag.checked_sub(new_stream_position)
                                                             {
@@ -1339,6 +1354,51 @@ impl Future for PlayerInternal {
                                             })
                                         }
                                     }
+                                } else {
+                                    let new_stream_position =
+                                        Duration::from_millis(new_stream_position_ms as u64);
+
+                                    let now = Instant::now();
+
+                                    match *reported_nominal_start_time {
+                                        None => (),
+                                        Some(reported_nominal_start_time) => {
+                                            trace!(
+                                                "reported_nominal_start_time: {:?}",
+                                                reported_nominal_start_time
+                                            );
+                                            trace!("now: {:?}", now);
+                                            trace!(
+                                                "new_stream_position: {:?}",
+                                                new_stream_position
+                                            );
+                                            // trace!(
+                                            //     "expected_position_ms: {:?}",
+                                            //     expected_position_ms
+                                            // );
+
+                                            if let Some(since_start) = now
+                                                .checked_duration_since(reported_nominal_start_time)
+                                            {
+                                                trace!("time since start: {:?}", since_start);
+                                                if let Some(ahead) =
+                                                    new_stream_position.checked_sub(since_start)
+                                                {
+                                                    trace!("ahead: {:?}", ahead);
+                                                }
+                                            }
+                                        }
+                                    };
+                                }
+
+                                trace!("bytes_per_second: {:?}", bytes_per_second);
+                                if packet.raw().is_ok() {
+                                    trace!("bytes_in_packet: {:?}", packet.raw().unwrap().len());
+                                    trace!(
+                                        "expected time to play packet: {:?}",
+                                        packet.raw().unwrap().len() as f64
+                                            / bytes_per_second as f64
+                                    );
                                 }
                             }
 
@@ -1544,7 +1604,7 @@ impl PlayerInternal {
         normalisation_factor: f64,
     ) {
         match packet {
-            Some((_, mut packet)) => {
+            Some((timing, mut packet)) => {
                 if !packet.is_empty() {
                     if let AudioPacket::Samples(ref mut data) = packet {
                         // Get the volume for the packet.
@@ -1657,14 +1717,51 @@ impl PlayerInternal {
                         }
                     }
 
+                    trace!("handle_packet packet timing: {:?}", timing);
+
+                    let timer = std::time::Instant::now();
                     if let Err(e) = self.sink.write(packet, &mut self.converter) {
                         error!("{}", e);
                         self.handle_pause();
                     }
+
+                    let prevent_buffering_ahead = true;
+
+                    if prevent_buffering_ahead {
+                        if let PlayerState::Playing {
+                            reported_nominal_start_time,
+                            ..
+                        } = self.state
+                        {
+                            let packet_end_duration =
+                                Duration::from_millis(timing.position_ms as u64);
+                            let now = std::time::Instant::now();
+
+                            if let Some(reported_start_time) = reported_nominal_start_time {
+                                if let Some(since_start) =
+                                    now.checked_duration_since(reported_start_time)
+                                {
+                                    trace!("time since start: {:?}", since_start);
+                                    if let Some(ahead) =
+                                        packet_end_duration.checked_sub(since_start)
+                                    {
+                                        trace!("ahead: {:?}", ahead);
+                                        if ahead > Duration::from_millis(100) {
+                                            trace!("sleeping to reset head buffer");
+                                            std::thread::sleep(ahead);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    trace!("Sink write took {:?}", timer.elapsed());
                 }
             }
 
             None => {
+                warn!("PlayerInternal handle_packet: No packet");
                 self.state.playing_to_end_of_track();
                 if let PlayerState::EndOfTrack {
                     track_id,
@@ -1765,6 +1862,7 @@ impl PlayerInternal {
         play: bool,
         position_ms: u32,
     ) -> PlayerResult {
+        trace!("PlayerInternal handle_command_load");
         let play_request_id =
             play_request_id_option.unwrap_or(self.play_request_id_generator.get());
 
@@ -1902,6 +2000,7 @@ impl PlayerInternal {
                         // This may be blocking
                         loaded_track.stream_position_ms = loaded_track.decoder.seek(position_ms)?;
                     }
+                    trace!("PlayerInternal handle_command_load: using preloaded track");
                     self.start_playback(track_id, play_request_id, *loaded_track, play);
                     return Ok(());
                 } else {
@@ -2180,6 +2279,7 @@ impl PlayerInternal {
     }
 
     fn send_event(&mut self, event: PlayerEvent) {
+        trace!("PlayerInternal::send_event: {:?}", event);
         self.event_senders
             .retain(|sender| sender.send(event.clone()).is_ok());
     }
@@ -2207,6 +2307,7 @@ impl PlayerInternal {
         let load_handle = thread::spawn(move || {
             let data = handle.block_on(loader.load_track(spotify_id, position_ms));
             if let Some(data) = data {
+                trace!("PlayerInternal::load_track: loaded track firing oneshot");
                 let _ = result_tx.send(data);
             }
 
