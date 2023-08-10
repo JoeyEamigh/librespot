@@ -3,7 +3,7 @@ use std::{
     future::Future,
     pin::Pin,
     sync::atomic::{AtomicUsize, Ordering},
-    sync::Arc,
+    sync::{Arc, RwLock},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -85,7 +85,7 @@ struct SpircTask {
 
     ident: String,
     device: DeviceState,
-    state: State,
+    state: Arc<RwLock<State>>,
     play_request_id: Option<u64>,
     play_status: SpircPlayStatus,
 
@@ -158,8 +158,8 @@ impl From<SpircLoadCommand> for State {
 const CONTEXT_TRACKS_HISTORY: usize = 10;
 const CONTEXT_FETCH_THRESHOLD: u32 = 5;
 
-const VOLUME_STEPS: i64 = 64;
-const VOLUME_STEP_SIZE: u16 = 1024; // (u16::MAX + 1) / VOLUME_STEPS
+const VOLUME_STEPS: i64 = 32;
+const VOLUME_STEP_SIZE: u16 = 2048; // (u16::MAX + 1) / VOLUME_STEPS
 
 pub struct Spirc {
     commands: mpsc::UnboundedSender<SpircCommand>,
@@ -275,7 +275,7 @@ impl Spirc {
         credentials: Credentials,
         player: Arc<Player>,
         mixer: Arc<dyn Mixer>,
-    ) -> Result<(Spirc, impl Future<Output = ()>), Error> {
+    ) -> Result<(Spirc, impl Future<Output = ()>, Arc<RwLock<State>>), Error> {
         let spirc_id = SPIRC_COUNTER.fetch_add(1, Ordering::AcqRel);
         debug!("new Spirc[{}]", spirc_id);
 
@@ -355,6 +355,8 @@ impl Spirc {
 
         let player_events = player.get_player_event_channel();
 
+        let state = Arc::new(RwLock::new(initial_state()));
+
         let mut task = SpircTask {
             player,
             mixer,
@@ -364,7 +366,7 @@ impl Spirc {
             ident,
 
             device,
-            state: initial_state(),
+            state: state.clone(),
             play_request_id: None,
             play_status: SpircPlayStatus::Stopped,
 
@@ -397,7 +399,7 @@ impl Spirc {
 
         task.hello()?;
 
-        Ok((spirc, task.run()))
+        Ok((spirc, task.run(), state))
     }
 
     pub fn play(&self) -> Result<(), Error> {
@@ -523,8 +525,8 @@ impl SpircTask {
                         self.session.spclient().get_next_page(&context_uri).await
                     } else {
                         // only send previous tracks that were before the current playback position
-                        let current_position = self.state.playing_track_index() as usize;
-                        let previous_tracks = self.state.track[..current_position].iter().filter_map(|t| SpotifyId::try_from(t).ok()).collect();
+                        let current_position = self.state.read().expect("rwlock poisoned").playing_track_index() as usize;
+                        let previous_tracks = self.state.read().expect("rwlock poisoned").track[..current_position].iter().filter_map(|t| SpotifyId::try_from(t).ok()).collect();
 
                         let scope = if self.autoplay_context {
                             "stations" // this returns a `StationContext` but we deserialize it into a `PageContext`
@@ -542,7 +544,7 @@ impl SpircTask {
                                     info!(
                                         "Resolved {:?} tracks from <{:?}>",
                                         context.tracks.len(),
-                                        self.state.context_uri(),
+                                        self.state.read().expect("rwlock poisoned").context_uri(),
                                     );
                                     Some(context)
                                 }
@@ -577,8 +579,14 @@ impl SpircTask {
 
     fn update_state_position(&mut self, position_ms: u32) {
         let now = self.now_ms();
-        self.state.set_position_measured_at(now as u64);
-        self.state.set_position_ms(position_ms);
+        self.state
+            .write()
+            .expect("rwlock poisoned")
+            .set_position_measured_at(now as u64);
+        self.state
+            .write()
+            .expect("rwlock poisoned")
+            .set_position_ms(position_ms);
     }
 
     fn handle_command(&mut self, cmd: SpircCommand) -> Result<(), Error> {
@@ -627,11 +635,17 @@ impl SpircTask {
                     self.notify(None)
                 }
                 SpircCommand::Shuffle(shuffle) => {
-                    self.state.set_shuffle(shuffle);
+                    self.state
+                        .write()
+                        .expect("rwlock poisoned")
+                        .set_shuffle(shuffle);
                     self.notify(None)
                 }
                 SpircCommand::Repeat(repeat) => {
-                    self.state.set_repeat(repeat);
+                    self.state
+                        .write()
+                        .expect("rwlock poisoned")
+                        .set_repeat(repeat);
                     self.notify(None)
                 }
                 SpircCommand::SetPosition(position) => {
@@ -681,16 +695,25 @@ impl SpircTask {
                         match self.play_status {
                             SpircPlayStatus::LoadingPlay { position_ms } => {
                                 self.update_state_position(position_ms);
-                                self.state.set_status(PlayStatus::kPlayStatusPlay);
+                                self.state
+                                    .write()
+                                    .expect("rwlock poisoned")
+                                    .set_status(PlayStatus::kPlayStatusPlay);
                                 trace!("==> kPlayStatusPlay");
                             }
                             SpircPlayStatus::LoadingPause { position_ms } => {
                                 self.update_state_position(position_ms);
-                                self.state.set_status(PlayStatus::kPlayStatusPause);
+                                self.state
+                                    .write()
+                                    .expect("rwlock poisoned")
+                                    .set_status(PlayStatus::kPlayStatusPause);
                                 trace!("==> kPlayStatusPause");
                             }
                             _ => {
-                                self.state.set_status(PlayStatus::kPlayStatusLoading);
+                                self.state
+                                    .write()
+                                    .expect("rwlock poisoned")
+                                    .set_status(PlayStatus::kPlayStatusLoading);
                                 self.update_state_position(0);
                                 trace!("==> kPlayStatusLoading");
                             }
@@ -717,7 +740,10 @@ impl SpircTask {
                             }
                             SpircPlayStatus::LoadingPlay { .. }
                             | SpircPlayStatus::LoadingPause { .. } => {
-                                self.state.set_status(PlayStatus::kPlayStatusPlay);
+                                self.state
+                                    .write()
+                                    .expect("rwlock poisoned")
+                                    .set_status(PlayStatus::kPlayStatusPlay);
                                 self.update_state_position(position_ms);
                                 self.play_status = SpircPlayStatus::Playing {
                                     nominal_start_time: new_nominal_start_time,
@@ -735,7 +761,10 @@ impl SpircTask {
                         trace!("==> kPlayStatusPause");
                         match self.play_status {
                             SpircPlayStatus::Paused { .. } | SpircPlayStatus::Playing { .. } => {
-                                self.state.set_status(PlayStatus::kPlayStatusPause);
+                                self.state
+                                    .write()
+                                    .expect("rwlock poisoned")
+                                    .set_status(PlayStatus::kPlayStatusPause);
                                 self.update_state_position(new_position_ms);
                                 self.play_status = SpircPlayStatus::Paused {
                                     position_ms: new_position_ms,
@@ -745,7 +774,10 @@ impl SpircTask {
                             }
                             SpircPlayStatus::LoadingPlay { .. }
                             | SpircPlayStatus::LoadingPause { .. } => {
-                                self.state.set_status(PlayStatus::kPlayStatusPause);
+                                self.state
+                                    .write()
+                                    .expect("rwlock poisoned")
+                                    .set_status(PlayStatus::kPlayStatusPause);
                                 self.update_state_position(new_position_ms);
                                 self.play_status = SpircPlayStatus::Paused {
                                     position_ms: new_position_ms,
@@ -761,7 +793,10 @@ impl SpircTask {
                         match self.play_status {
                             SpircPlayStatus::Stopped => Ok(()),
                             _ => {
-                                self.state.set_status(PlayStatus::kPlayStatusStop);
+                                self.state
+                                    .write()
+                                    .expect("rwlock poisoned")
+                                    .set_status(PlayStatus::kPlayStatusStop);
                                 self.play_status = SpircPlayStatus::Stopped;
                                 self.notify(None)
                             }
@@ -923,7 +958,10 @@ impl SpircTask {
 
             MessageType::kMessageTypeRepeat => {
                 let repeat = update.state.repeat();
-                self.state.set_repeat(repeat);
+                self.state
+                    .write()
+                    .expect("rwlock poisoned")
+                    .set_repeat(repeat);
 
                 self.player.emit_repeat_changed_event(repeat);
 
@@ -932,17 +970,27 @@ impl SpircTask {
 
             MessageType::kMessageTypeShuffle => {
                 let shuffle = update.state.shuffle();
-                self.state.set_shuffle(shuffle);
+                self.state
+                    .write()
+                    .expect("rwlock poisoned")
+                    .set_shuffle(shuffle);
                 if shuffle {
-                    let current_index = self.state.playing_track_index();
-                    let tracks = &mut self.state.track;
+                    let current_index = self
+                        .state
+                        .read()
+                        .expect("rwlock poisoned")
+                        .playing_track_index();
+                    let tracks = &mut self.state.write().expect("rwlock poisoned").track;
                     if !tracks.is_empty() {
                         tracks.swap(0, current_index as usize);
                         if let Some((_, rest)) = tracks.split_first_mut() {
                             let mut rng = rand::thread_rng();
                             rest.shuffle(&mut rng);
                         }
-                        self.state.set_playing_track_index(0);
+                        self.state
+                            .write()
+                            .expect("rwlock poisoned")
+                            .set_playing_track_index(0);
                     }
                 }
                 self.player.emit_shuffle_changed_event(shuffle);
@@ -1039,9 +1087,11 @@ impl SpircTask {
         self.player
             .emit_filter_explicit_content_changed_event(self.session.filter_explicit_content());
 
-        self.player.emit_shuffle_changed_event(self.state.shuffle());
+        self.player
+            .emit_shuffle_changed_event(self.state.read().expect("rwlock poisoned").shuffle());
 
-        self.player.emit_repeat_changed_event(self.state.repeat());
+        self.player
+            .emit_repeat_changed_event(self.state.read().expect("rwlock poisoned").repeat());
     }
 
     fn handle_load(&mut self, state: &State) -> Result<(), Error> {
@@ -1059,7 +1109,7 @@ impl SpircTask {
 
         self.update_tracks(state);
 
-        if !self.state.track.is_empty() {
+        if !self.state.read().expect("rwlock poisoned").track.is_empty() {
             let start_playing = state.status() == PlayStatus::kPlayStatusPlay;
             self.load_track(start_playing, state.position_ms());
         } else {
@@ -1076,7 +1126,10 @@ impl SpircTask {
                 preloading_of_next_track_triggered,
             } => {
                 self.player.play();
-                self.state.set_status(PlayStatus::kPlayStatusPlay);
+                self.state
+                    .write()
+                    .expect("rwlock poisoned")
+                    .set_status(PlayStatus::kPlayStatusPlay);
                 self.update_state_position(position_ms);
                 self.play_status = SpircPlayStatus::Playing {
                     nominal_start_time: self.now_ms() - position_ms as i64,
@@ -1115,7 +1168,10 @@ impl SpircTask {
                 preloading_of_next_track_triggered,
             } => {
                 self.player.pause();
-                self.state.set_status(PlayStatus::kPlayStatusPause);
+                self.state
+                    .write()
+                    .expect("rwlock poisoned")
+                    .set_status(PlayStatus::kPlayStatusPause);
                 let position_ms = (self.now_ms() - nominal_start_time) as u32;
                 self.update_state_position(position_ms);
                 self.play_status = SpircPlayStatus::Paused {
@@ -1157,9 +1213,19 @@ impl SpircTask {
     fn consume_queued_track(&mut self) -> usize {
         // Removes current track if it is queued
         // Returns the index of the next track
-        let current_index = self.state.playing_track_index() as usize;
-        if (current_index < self.state.track.len()) && self.state.track[current_index].queued() {
-            self.state.track.remove(current_index);
+        let current_index = self
+            .state
+            .read()
+            .expect("rwlock poisoned")
+            .playing_track_index() as usize;
+        if (current_index < self.state.read().expect("rwlock poisoned").track.len())
+            && self.state.read().expect("rwlock poisoned").track[current_index].queued()
+        {
+            self.state
+                .write()
+                .expect("rwlock poisoned")
+                .track
+                .remove(current_index);
             current_index
         } else {
             current_index + 1
@@ -1167,8 +1233,14 @@ impl SpircTask {
     }
 
     fn preview_next_track(&mut self) -> Option<SpotifyId> {
-        self.get_track_id_to_play_from_playlist(self.state.playing_track_index() + 1)
-            .map(|(track_id, _)| track_id)
+        self.get_track_id_to_play_from_playlist(
+            self.state
+                .read()
+                .expect("rwlock poisoned")
+                .playing_track_index()
+                + 1,
+        )
+        .map(|(track_id, _)| track_id)
     }
 
     fn handle_preload_next_track(&mut self) {
@@ -1199,23 +1271,37 @@ impl SpircTask {
         let unavailables = self.get_track_index_for_spotify_id(&track_id, 0);
         for &index in unavailables.iter() {
             let mut unplayable_track_ref = TrackRef::new();
-            unplayable_track_ref.set_gid(self.state.track[index].gid().to_vec());
+            unplayable_track_ref.set_gid(
+                self.state.read().expect("rwlock poisoned").track[index]
+                    .gid()
+                    .to_vec(),
+            );
             // Misuse context field to flag the track
             unplayable_track_ref.set_context(String::from("NonPlayable"));
-            std::mem::swap(&mut self.state.track[index], &mut unplayable_track_ref);
+            std::mem::swap(
+                &mut self.state.write().expect("rwlock poisoned").track[index],
+                &mut unplayable_track_ref,
+            );
             debug!(
                 "Marked <{:?}> at {:?} as NonPlayable",
-                self.state.track[index], index,
+                self.state.read().expect("rwlock poisoned").track[index],
+                index,
             );
         }
         self.handle_preload_next_track();
     }
 
     fn handle_next(&mut self) {
-        let context_uri = self.state.context_uri().to_owned();
-        let mut tracks_len = self.state.track.len() as u32;
+        let context_uri = self
+            .state
+            .read()
+            .expect("rwlock poisoned")
+            .context_uri()
+            .to_owned();
+        let mut tracks_len = self.state.read().expect("rwlock poisoned").track.len() as u32;
         let mut new_index = self.consume_queued_track() as u32;
-        let mut continue_playing = self.state.status() == PlayStatus::kPlayStatusPlay;
+        let mut continue_playing =
+            self.state.read().expect("rwlock poisoned").status() == PlayStatus::kPlayStatusPlay;
 
         let update_tracks =
             self.autoplay_context && tracks_len - new_index < CONTEXT_FETCH_THRESHOLD;
@@ -1233,7 +1319,7 @@ impl SpircTask {
             if let Some(ref context) = self.context {
                 self.resolve_context = Some(context.next_page_url.to_owned());
                 self.update_tracks_from_context();
-                tracks_len = self.state.track.len() as u32;
+                tracks_len = self.state.read().expect("rwlock poisoned").track.len() as u32;
             }
         }
 
@@ -1246,22 +1332,34 @@ impl SpircTask {
                 debug!("Starting autoplay for <{}>", context_uri);
                 // force reloading the current context with an autoplay context
                 self.autoplay_context = true;
-                self.resolve_context = Some(self.state.context_uri().to_owned());
+                self.resolve_context = Some(
+                    self.state
+                        .read()
+                        .expect("rwlock poisoned")
+                        .context_uri()
+                        .to_owned(),
+                );
                 self.update_tracks_from_context();
                 self.player.set_auto_normalise_as_album(false);
             } else {
                 new_index = 0;
-                continue_playing &= self.state.repeat();
+                continue_playing &= self.state.read().expect("rwlock poisoned").repeat();
                 debug!("Looping back to start, repeat is {}", continue_playing);
             }
         }
 
         if tracks_len > 0 {
-            self.state.set_playing_track_index(new_index);
+            self.state
+                .write()
+                .expect("rwlock poisoned")
+                .set_playing_track_index(new_index);
             self.load_track(continue_playing, 0);
         } else {
             info!("Not playing next track because there are no more tracks left in queue.");
-            self.state.set_playing_track_index(0);
+            self.state
+                .write()
+                .expect("rwlock poisoned")
+                .set_playing_track_index(0);
             self.handle_stop();
         }
     }
@@ -1277,29 +1375,41 @@ impl SpircTask {
             let mut queue_tracks = Vec::new();
             {
                 let queue_index = self.consume_queued_track();
-                let tracks = &mut self.state.track;
+                let tracks = &mut self.state.write().expect("rwlock poisoned").track;
                 while queue_index < tracks.len() && tracks[queue_index].queued() {
                     queue_tracks.push(tracks.remove(queue_index));
                 }
             }
-            let current_index = self.state.playing_track_index();
+            let current_index = self
+                .state
+                .read()
+                .expect("rwlock poisoned")
+                .playing_track_index();
             let new_index = if current_index > 0 {
                 current_index - 1
-            } else if self.state.repeat() {
-                self.state.track.len() as u32 - 1
+            } else if self.state.read().expect("rwlock poisoned").repeat() {
+                self.state.read().expect("rwlock poisoned").track.len() as u32 - 1
             } else {
                 0
             };
             // Reinsert queued tracks after the new playing track.
             let mut pos = (new_index + 1) as usize;
             for track in queue_tracks {
-                self.state.track.insert(pos, track);
+                self.state
+                    .write()
+                    .expect("rwlock poisoned")
+                    .track
+                    .insert(pos, track);
                 pos += 1;
             }
 
-            self.state.set_playing_track_index(new_index);
+            self.state
+                .write()
+                .expect("rwlock poisoned")
+                .set_playing_track_index(new_index);
 
-            let start_playing = self.state.status() == PlayStatus::kPlayStatusPlay;
+            let start_playing =
+                self.state.read().expect("rwlock poisoned").status() == PlayStatus::kPlayStatusPlay;
             self.load_track(start_playing, 0);
         } else {
             self.handle_seek(0);
@@ -1339,20 +1449,25 @@ impl SpircTask {
 
             debug!("Adding {:?} tracks from context to frame", new_tracks.len());
 
-            let mut track_vec = self.state.track.clone();
+            let mut track_vec = self.state.read().expect("rwlock poisoned").track.clone();
             if let Some(head) = track_vec.len().checked_sub(CONTEXT_TRACKS_HISTORY) {
                 track_vec.drain(0..head);
             }
             track_vec.extend_from_slice(new_tracks);
-            self.state.track = track_vec;
+            self.state.write().expect("rwlock poisoned").track = track_vec;
 
             // Update playing index
             if let Some(new_index) = self
                 .state
+                .read()
+                .expect("rwlock poisoned")
                 .playing_track_index()
                 .checked_sub(CONTEXT_TRACKS_HISTORY as u32)
             {
-                self.state.set_playing_track_index(new_index);
+                self.state
+                    .write()
+                    .expect("rwlock poisoned")
+                    .set_playing_track_index(new_index);
             }
         } else {
             warn!("No context to update from!");
@@ -1376,18 +1491,30 @@ impl SpircTask {
         self.player
             .set_auto_normalise_as_album(context_uri.starts_with("spotify:album:"));
 
-        self.state.set_playing_track_index(index);
-        self.state.track = tracks.to_vec();
-        self.state.set_context_uri(context_uri.to_owned());
+        self.state
+            .write()
+            .expect("rwlock poisoned")
+            .set_playing_track_index(index);
+        self.state.write().expect("rwlock poisoned").track = tracks.to_vec();
+        self.state
+            .write()
+            .expect("rwlock poisoned")
+            .set_context_uri(context_uri.to_owned());
         // has_shuffle/repeat seem to always be true in these replace msgs,
         // but to replicate the behaviour of the Android client we have to
         // ignore false values.
         let state = state;
         if state.repeat() {
-            self.state.set_repeat(true);
+            self.state
+                .write()
+                .expect("rwlock poisoned")
+                .set_repeat(true);
         }
         if state.shuffle() {
-            self.state.set_shuffle(true);
+            self.state
+                .write()
+                .expect("rwlock poisoned")
+                .set_shuffle(true);
         }
     }
 
@@ -1397,7 +1524,7 @@ impl SpircTask {
         track_id: &SpotifyId,
         start_index: usize,
     ) -> Vec<usize> {
-        let index: Vec<usize> = self.state.track[start_index..]
+        let index: Vec<usize> = self.state.read().expect("rwlock poisoned").track[start_index..]
             .iter()
             .enumerate()
             .filter(|&(_, track_ref)| track_ref.gid() == track_id.to_raw())
@@ -1412,7 +1539,7 @@ impl SpircTask {
     }
 
     fn get_track_id_to_play_from_playlist(&self, index: u32) -> Option<(SpotifyId, u32)> {
-        let tracks_len = self.state.track.len();
+        let tracks_len = self.state.read().expect("rwlock poisoned").track.len();
 
         // Guard against tracks_len being zero to prevent
         // 'index out of bounds: the len is 0 but the index is 0'
@@ -1434,7 +1561,8 @@ impl SpircTask {
         // tracks in each frame either have a gid or uri (that may or may not be a valid track)
         // E.g - context based frames sometimes contain tracks with <spotify:meta:page:>
 
-        let mut track_ref = self.state.track[new_playlist_index].clone();
+        let mut track_ref =
+            self.state.read().expect("rwlock poisoned").track[new_playlist_index].clone();
         let mut track_id = SpotifyId::try_from(&track_ref);
         while self.track_ref_is_unavailable(&track_ref) || track_id.is_err() {
             warn!(
@@ -1451,7 +1579,8 @@ impl SpircTask {
                 warn!("No playable track found in state: {:?}", self.state);
                 return None;
             }
-            track_ref = self.state.track[new_playlist_index].clone();
+            track_ref =
+                self.state.read().expect("rwlock poisoned").track[new_playlist_index].clone();
             track_id = SpotifyId::try_from(&track_ref);
         }
 
@@ -1462,20 +1591,33 @@ impl SpircTask {
     }
 
     fn load_track(&mut self, start_playing: bool, position_ms: u32) {
-        let index = self.state.playing_track_index();
+        let index = self
+            .state
+            .read()
+            .expect("rwlock poisoned")
+            .playing_track_index();
 
         match self.get_track_id_to_play_from_playlist(index) {
             Some((track, index)) => {
-                self.state.set_playing_track_index(index);
+                self.state
+                    .write()
+                    .expect("rwlock poisoned")
+                    .set_playing_track_index(index);
 
                 self.player.load(track, start_playing, position_ms);
 
                 self.update_state_position(position_ms);
                 if start_playing {
-                    self.state.set_status(PlayStatus::kPlayStatusPlay);
+                    self.state
+                        .write()
+                        .expect("rwlock poisoned")
+                        .set_status(PlayStatus::kPlayStatusPlay);
                     self.play_status = SpircPlayStatus::LoadingPlay { position_ms };
                 } else {
-                    self.state.set_status(PlayStatus::kPlayStatusPause);
+                    self.state
+                        .write()
+                        .expect("rwlock poisoned")
+                        .set_status(PlayStatus::kPlayStatusPause);
                     self.play_status = SpircPlayStatus::LoadingPause { position_ms };
                 }
             }
@@ -1490,7 +1632,7 @@ impl SpircTask {
     }
 
     fn notify(&mut self, recipient: Option<&str>) -> Result<(), Error> {
-        let status = self.state.status();
+        let status = self.state.read().expect("rwlock poisoned").status();
 
         // When in loading state, the Spotify UI is disabled for interaction.
         // On desktop this isn't so bad but on mobile it means that the bottom
@@ -1564,7 +1706,8 @@ impl<'a> CommandSender<'a> {
 
     fn send(mut self) -> Result<(), Error> {
         if self.frame.state.is_none() && self.spirc.device.is_active() {
-            *self.frame.state.mut_or_insert_default() = self.spirc.state.clone();
+            *self.frame.state.mut_or_insert_default() =
+                self.spirc.state.read().expect("rwlock poisoned").clone();
         }
 
         self.spirc.sender.send(self.frame.write_to_bytes()?)

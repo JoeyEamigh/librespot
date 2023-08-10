@@ -50,7 +50,7 @@ async fn main() {
         move || backend(None, audio_format),
     );
 
-    let (spirc, spirc_task) = Spirc::new(
+    let (spirc, spirc_task, _) = Spirc::new(
         connect_config,
         session.clone(),
         credentials,

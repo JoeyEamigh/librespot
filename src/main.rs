@@ -1798,7 +1798,7 @@ async fn main() {
                                                                 last_credentials.clone().unwrap_or_default(),
                                                                 player.clone(),
                                                                 mixer.clone()).await {
-                    Ok((spirc_, spirc_task_)) => (spirc_, spirc_task_),
+                    Ok((spirc_, spirc_task_, _)) => (spirc_, spirc_task_),
                     Err(e) => {
                         error!("could not initialize spirc: {}", e);
                         exit(1);
